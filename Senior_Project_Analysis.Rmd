@@ -1,0 +1,619 @@
+---
+title: "AI Tool Use, Academic Impact, and Work Readiness Among College Students"
+author: "Zainab Safdary"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE,
+                      fig.align = "center", fig.width = 7.5, fig.height = 4.5)
+
+# ---- Check packages BEFORE loading (gives one clear message if any are missing)
+needed  <- c("readr", "dplyr", "tidyr", "ggplot2", "knitr", "sandwich", "lmtest", "MASS")
+missing <- needed[!vapply(needed, requireNamespace, logical(1), quietly = TRUE)]
+if (length(missing) > 0) {
+  stop("Run this in the Console, then restart R (Cmd+Shift+0) and knit again:\n",
+       "install.packages(c(", paste0('"', missing, '"', collapse = ", "), "))")
+}
+
+library(MASS)      # loaded before dplyr so dplyr::select is not masked
+library(readr)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(knitr)
+library(sandwich)
+library(lmtest)
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5),
+          plot.subtitle = element_text(hjust = 0.5, color = "grey35"),
+          axis.title = element_text(face = "bold"),
+          panel.grid.minor = element_blank())
+)
+pal <- c(AIS = "#2C7FB8", WRS = "#41AB5D")
+```
+
+```{r helpers, include=FALSE}
+# ---- Small helper functions used throughout the report ----------------------
+
+stars <- function(p) ifelse(p < .01, "***", ifelse(p < .05, "**", ifelse(p < .10, "*", "")))
+
+fmt_p <- function(p) ifelse(p < .001, "< .001", sprintf("%.3f", p))
+
+# For use inside sentences: "p < .001" or "p = 0.023"
+p_text <- function(p) ifelse(p < .001, "p < .001", sprintf("p = %.3f", p))
+
+# Readable names for regression terms (":" is replaced first on purpose)
+pretty_term <- function(x) {
+  x <- gsub("\\(Intercept\\)", "Intercept", x)
+  x <- gsub(":", " × ", x)
+  x <- gsub("AI_Usage_Freq", "AI usage frequency", x)
+  x <- gsub("Usage_Level", "Usage level = ", x)
+  x <- gsub("Course_Group", "Course = ", x)
+  x <- gsub("College_Year", "Year = ", x)
+  x <- gsub("English_PrimaryNo", "English not primary language", x)
+  x
+}
+
+# Coefficients with HC3 heteroskedasticity-robust standard errors
+robust_coefs <- function(model) {
+  ct <- coeftest(model, vcov. = vcovHC(model, type = "HC3"))
+  data.frame(term = rownames(ct), est = ct[, 1], se = ct[, 2], p = ct[, 4],
+             row.names = NULL)
+}
+
+# Side-by-side regression table: "estimate*** (robust SE)" in each cell
+reg_table <- function(models, caption) {
+  cols <- lapply(names(models), function(nm) {
+    rc  <- robust_coefs(models[[nm]])
+    out <- data.frame(term = rc$term,
+                      value = sprintf("%.3f%s (%.3f)", rc$est, stars(rc$p), rc$se))
+    names(out)[2] <- nm
+    out
+  })
+  tab <- Reduce(function(a, b) full_join(a, b, by = "term"), cols)
+  tab$term <- pretty_term(tab$term)
+
+  fit <- data.frame(
+    term = c("Observations", "R²", "Adjusted R²"),
+    vapply(models, function(m) c(as.character(nobs(m)),
+                                 sprintf("%.3f", summary(m)$r.squared),
+                                 sprintf("%.3f", summary(m)$adj.r.squared)),
+           character(3)),
+    check.names = FALSE
+  )
+  tab <- rbind(tab, fit)
+  tab[is.na(tab)] <- ""
+  names(tab)[1] <- ""
+  kable(tab, caption = caption, align = c("l", rep("c", length(models))))
+}
+
+# Cronbach's alpha, written out so no extra package is needed
+cronbach_alpha <- function(items) {
+  items <- as.matrix(items)
+  k <- ncol(items)
+  (k / (k - 1)) * (1 - sum(apply(items, 2, var)) / var(rowSums(items)))
+}
+```
+
+```{r load-data}
+# Looks next to this .Rmd file first, then in Desktop/Senior Project
+paths     <- c("survey_data.csv", "~/Desktop/Senior Project/survey_data.csv")
+data_path <- paths[file.exists(paths)][1]
+if (is.na(data_path)) {
+  stop("survey_data.csv not found. Save this .Rmd in the same folder as the CSV.")
+}
+
+raw <- read_csv(data_path, show_col_types = FALSE)
+```
+
+```{r clean}
+survey <- raw %>%
+  mutate(
+    # Fix a typo in the age responses
+    Age_Range = recode(Age_Range, "Obove 18" = "Above 18"),
+    Under_18  = Age_Range == "Under 18",
+
+    # "Languages and Linguistics" has only 4 students, so it is grouped with "other"
+    Course_Group = case_when(
+      Course_Type %in% c("other...", "Languages and Linguistics") ~ "Other",
+      TRUE ~ Course_Type),
+    Course_Group = factor(Course_Group,
+                          levels = c("Mathematics + Computer Science", "Social Sciences",
+                                     "Writing and Composition", "Other")),
+
+    College_Year    = factor(College_Year,
+                             levels = c("Freshman", "Sophomore", "Junior", "Senior")),
+    English_Primary = factor(Primary_English, levels = c("Yes", "No")),
+
+    # Usage as categories (for testing whether the effect is linear)
+    Usage_Level = factor(AI_Usage_Freq, levels = 0:4,
+                         labels = c("0 times", "1-2", "3-4", "5-6", "More than 6")),
+
+    # Rebuild the composites from their items to confirm the file is correct
+    AIS_check = 0.4 * Learning_vs_Completion + 0.3 * Grade_Improvement_Pct +
+                0.3 * Extra_Time_Activities,
+    WRS_check = 0.4 * AI_Career_Importance + 0.3 * Productivity_Loss_Pct +
+                0.3 * Work_Quality_Comparison,
+
+    # Alternative versions used in the robustness section
+    AIS_equal    = (Learning_vs_Completion + Grade_Improvement_Pct + Extra_Time_Activities) / 3,
+    WRS_equal    = (AI_Career_Importance + Productivity_Loss_Pct + Work_Quality_Comparison) / 3,
+    WRS_reversed = 0.4 * AI_Career_Importance + 0.3 * (1 - Productivity_Loss_Pct) +
+                   0.3 * Work_Quality_Comparison
+  )
+
+stopifnot(max(abs(survey$AIS - survey$AIS_check)) < 0.001,
+          max(abs(survey$WRS - survey$WRS_check)) < 0.001)
+
+n_total <- nrow(survey)
+n_minor <- sum(survey$Under_18)
+```
+
+# Introduction
+
+This study tests three hypotheses:
+
+- **H1.** Students who use AI tools more often report a higher Academic Impact Score (AIS).
+- **H2.** Students who use AI tools more often report a higher Work Readiness Score (WRS).
+- **H3.** The relationship between AI use and these outcomes differs by course type.
+
+# Data and Measures
+
+The data come from an online survey of `r n_total` college students collected in
+October 2024. All participants gave consent. Survey responses were converted to
+numeric scales before analysis:
+
+- **AI usage frequency** is coded 0–4 (0 times, 1–2, 3–4, 5–6, more than 6).
+- **Single items** are rescaled to run from 0 (lowest response) to 1 (highest).
+- **Academic Impact Score (AIS)** = 0.4 × learning vs. completion + 0.3 × grade
+  improvement + 0.3 × uses saved time differently.
+- **Work Readiness Score (WRS)** = 0.4 × AI career importance + 0.3 × productivity
+  loss without AI + 0.3 × work quality with AI.
+- Four additional attitude items are measured on 1–5 scales.
+
+"Languages and Linguistics" (4 students) is combined with "Other" because a group
+that small cannot be estimated reliably.
+
+## Sample characteristics
+
+```{r demographics}
+demo_vars <- c(College_Year = "College year", Course_Group = "Course type",
+               Age_Range = "Age", Primary_English = "English is primary language")
+
+demo <- bind_rows(lapply(names(demo_vars), function(v) {
+  survey %>%
+    count(Category = as.character(.data[[v]])) %>%
+    mutate(Variable = demo_vars[[v]],
+           Percent = sprintf("%.1f%%", 100 * n / sum(n)))
+})) %>%
+  dplyr::select(Variable, Category, N = n, Percent)
+
+demo$Variable[duplicated(demo$Variable)] <- ""
+kable(demo, caption = "Sample characteristics", align = c("l", "l", "r", "r"))
+```
+
+```{r descriptives}
+num_vars <- c(
+  AI_Usage_Freq           = "AI usage frequency (0–4)",
+  AIS                     = "Academic Impact Score (0–1)",
+  WRS                     = "Work Readiness Score (0–1)",
+  Learning_vs_Completion  = "  Learning vs. completion",
+  Grade_Improvement_Pct   = "  Grade improvement",
+  Extra_Time_Activities   = "  Uses saved time differently (0/1)",
+  AI_Career_Importance    = "  AI career importance",
+  Productivity_Loss_Pct   = "  Productivity loss without AI",
+  Work_Quality_Comparison = "  Work quality with AI",
+  AI_Learning_Alignment   = "AI learning alignment (1–5)",
+  AI_Usage_Likelihood     = "AI usage likelihood (1–5)",
+  AI_Good_Student         = "AI and being a good student (1–5)",
+  AI_Thinking_Change      = "AI changes thinking (1–5)"
+)
+
+survey %>%
+  dplyr::select(all_of(names(num_vars))) %>%
+  pivot_longer(everything(), names_to = "var", values_to = "value") %>%
+  group_by(var) %>%
+  summarise(N = sum(!is.na(value)), Mean = mean(value, na.rm = TRUE),
+            SD = sd(value, na.rm = TRUE), Min = min(value, na.rm = TRUE),
+            Median = median(value, na.rm = TRUE), Max = max(value, na.rm = TRUE),
+            .groups = "drop") %>%
+  mutate(Variable = num_vars[var]) %>%
+  arrange(match(var, names(num_vars))) %>%
+  dplyr::select(Variable, N, Mean, SD, Min, Median, Max) %>%
+  kable(digits = 2, caption = "Table 2. Descriptive statistics")
+```
+
+```{r usage-plot}
+ggplot(survey, aes(x = Usage_Level)) +
+  geom_bar(fill = pal[["AIS"]], alpha = 0.85, width = 0.7) +
+  geom_text(stat = "count", aes(label = after_stat(count)), vjust = -0.4) +
+  labs(title = "Students AI Tools Usage Frequency",
+       x = "AI usage frequency", y = "Number of students")
+```
+
+```{r score-hist}
+survey %>%
+  dplyr::select(AIS, WRS) %>%
+  pivot_longer(everything(), names_to = "Score", values_to = "Value") %>%
+  ggplot(aes(x = Value, fill = Score)) +
+  geom_histogram(binwidth = 0.1, boundary = 0, color = "white", alpha = 0.9) +
+  facet_wrap(~ Score, labeller = as_labeller(c(AIS = "Academic Impact Score",
+                                               WRS = "Work Readiness Score"))) +
+  scale_fill_manual(values = pal, guide = "none") +
+  labs(title = "Distribution of Composite Scores",
+       x = "Score (0–1)", y = "Number of students")
+```
+
+```{r miss-plot, fig.height=3.5}
+survey %>%
+  count(Miss_AI_Most) %>%
+  mutate(Miss_AI_Most = reorder(Miss_AI_Most, n)) %>%
+  ggplot(aes(x = n, y = Miss_AI_Most)) +
+  geom_col(fill = "grey45", width = 0.65) +
+  geom_text(aes(label = n), hjust = -0.3) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.1))) +
+  labs(title = "What Students Would Miss Most Without AI",
+       x = "Number of students", y = NULL)
+```
+
+# Measurement Quality
+
+Before using the composite scores, I check whether their items measure a common
+idea (internal consistency) and whether the chosen weights are reasonable.
+
+```{r reliability}
+ais_items <- survey %>%
+  dplyr::select(Learning_vs_Completion, Grade_Improvement_Pct, Extra_Time_Activities)
+wrs_items <- survey %>%
+  dplyr::select(AI_Career_Importance, Productivity_Loss_Pct, Work_Quality_Comparison)
+
+alpha_ais <- cronbach_alpha(ais_items)
+alpha_wrs <- cronbach_alpha(wrs_items)
+
+# First principal component: how strongly each item reflects the shared factor
+pca_weights <- function(items) {
+  pc   <- prcomp(items, scale. = TRUE)
+  load <- pc$rotation[, 1]
+  if (sum(load) < 0) load <- -load
+  list(loadings = load,
+       weights  = load / sum(load),
+       var_expl = summary(pc)$importance[2, 1])
+}
+pca_ais <- pca_weights(ais_items)
+pca_wrs <- pca_weights(wrs_items)
+
+kable(data.frame(
+  Score = c("AIS", "WRS"),
+  `Cronbach's alpha` = round(c(alpha_ais, alpha_wrs), 3),
+  `Variance explained by 1st component` = sprintf("%.1f%%", 100 * c(pca_ais$var_expl, pca_wrs$var_expl)),
+  check.names = FALSE
+), caption = "Table 3. Internal consistency of composite scores")
+
+kable(data.frame(
+  Score = rep(c("AIS", "WRS"), each = 3),
+  Item = c(names(ais_items), names(wrs_items)),
+  `Chosen weight` = c(0.4, 0.3, 0.3, 0.4, 0.3, 0.3),
+  `PCA-implied weight` = round(c(pca_ais$weights, pca_wrs$weights), 2),
+  check.names = FALSE
+), caption = "Table 4. Chosen weights compared with data-driven (PCA) weights")
+```
+
+Cronbach's alpha is `r round(alpha_ais, 2)` for AIS and `r round(alpha_wrs, 2)`
+for WRS. Both are below the conventional 0.70 benchmark. This means the items are
+related but capture somewhat different experiences, so the composites should be
+read as *indices* that summarize several outcomes, not as measures of one single
+trait. With only three items per score, lower alpha values are expected. Section 6
+checks whether the main results depend on how the scores are weighted.
+
+# Results
+
+## Correlations
+
+```{r corr-heatmap, fig.height=5.5, fig.width=7.5}
+corr_vars <- c(AI_Usage_Freq = "AI usage", AIS = "AIS", WRS = "WRS",
+               AI_Learning_Alignment = "Learning alignment",
+               AI_Usage_Likelihood = "Usage likelihood",
+               AI_Good_Student = "Good student",
+               AI_Thinking_Change = "Thinking change")
+
+cm <- cor(survey[, names(corr_vars)], method = "spearman")
+dimnames(cm) <- list(corr_vars, corr_vars)
+
+as.data.frame(as.table(cm)) %>%
+  ggplot(aes(Var1, Var2, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = sprintf("%.2f", Freq)), size = 3.5) +
+  scale_fill_gradient2(low = "#D73027", mid = "white", high = "#2C7FB8",
+                       limits = c(-1, 1), name = "Spearman ρ") +
+  labs(title = "Correlations Among Key Variables", x = NULL, y = NULL) +
+  theme(axis.text.x = element_text(angle = 35, hjust = 1))
+
+ct_ais <- cor.test(survey$AI_Usage_Freq, survey$AIS, method = "spearman", exact = FALSE)
+ct_wrs <- cor.test(survey$AI_Usage_Freq, survey$WRS, method = "spearman", exact = FALSE)
+```
+
+Spearman correlations are used because AI usage is an ordered category. AI usage
+is strongly correlated with both AIS (ρ = `r round(ct_ais$estimate, 2)`,
+`r p_text(ct_ais$p.value)`) and WRS (ρ = `r round(ct_wrs$estimate, 2)`,
+`r p_text(ct_wrs$p.value)`).
+
+## Scores by level of AI use
+
+```{r means-by-usage}
+usage_means <- survey %>%
+  pivot_longer(c(AIS, WRS), names_to = "Score", values_to = "Value") %>%
+  group_by(Score, Usage_Level) %>%
+  summarise(n = n(), mean = mean(Value), se = sd(Value) / sqrt(n()), .groups = "drop") %>%
+  mutate(lo = mean - qt(0.975, n - 1) * se,
+         hi = mean + qt(0.975, n - 1) * se)
+
+ggplot(usage_means, aes(x = Usage_Level, y = mean, color = Score, group = Score)) +
+  geom_line(linewidth = 1, position = position_dodge(width = 0.3)) +
+  geom_pointrange(aes(ymin = lo, ymax = hi), position = position_dodge(width = 0.3)) +
+  scale_color_manual(values = pal) +
+  labs(title = "Average Scores by AI Usage Frequency",
+       subtitle = "Points are group means; bars are 95% confidence intervals",
+       x = "AI usage frequency", y = "Mean score (0–1)", color = NULL)
+```
+
+The "5-6" group has only `r sum(survey$AI_Usage_Freq == 3)` students, which is why
+its confidence interval is wide.
+
+## Regression models
+
+Four models are estimated for each outcome:
+
+1. **Simple:** AI usage only.
+2. **Controlled:** adds course type, college year, and whether English is the
+   student's primary language.
+3. **Categorical:** treats usage as separate categories to test whether each step
+   up has the same effect.
+4. **Interaction:** lets the effect of AI usage differ by course type (H3).
+
+All standard errors are HC3 heteroskedasticity-robust.
+\* p < .10, \*\* p < .05, \*\*\* p < .01.
+
+```{r models}
+controls <- "Course_Group + College_Year + English_Primary"
+
+fit_set <- function(outcome) {
+  list(
+    Simple      = lm(as.formula(paste(outcome, "~ AI_Usage_Freq")), data = survey),
+    Controlled  = lm(as.formula(paste(outcome, "~ AI_Usage_Freq +", controls)), data = survey),
+    Categorical = lm(as.formula(paste(outcome, "~ Usage_Level +", controls)), data = survey),
+    Interaction = lm(as.formula(paste(outcome, "~ AI_Usage_Freq * Course_Group +",
+                                      "College_Year + English_Primary")), data = survey)
+  )
+}
+ais_models <- fit_set("AIS")
+wrs_models <- fit_set("WRS")
+```
+
+```{r ais-table}
+reg_table(ais_models, "Table 5. Predictors of Academic Impact Score (robust SEs)")
+```
+
+```{r wrs-table}
+reg_table(wrs_models, "Table 6. Predictors of Work Readiness Score (robust SEs)")
+```
+
+```{r model-tests}
+nested_p <- function(small, big) anova(small, big)$`Pr(>F)`[2]
+
+usage_effect <- function(models, outcome) {
+  full    <- models$Controlled
+  reduced <- lm(as.formula(paste(outcome, "~", controls)), data = survey)
+  r2_full <- summary(full)$r.squared
+  r2_red  <- summary(reduced)$r.squared
+  std_fit <- lm(as.formula(paste0("scale(", outcome, ") ~ scale(AI_Usage_Freq) +", controls)),
+                data = survey)
+  rc <- robust_coefs(full)
+  rc <- rc[rc$term == "AI_Usage_Freq", ]
+  data.frame(
+    Outcome = outcome,
+    `b (per usage step)` = round(rc$est, 3),
+    `95% CI` = sprintf("[%.3f, %.3f]", rc$est - 1.96 * rc$se, rc$est + 1.96 * rc$se),
+    `Standardized β` = round(coef(std_fit)[["scale(AI_Usage_Freq)"]], 2),
+    `Cohen's f²` = round((r2_full - r2_red) / (1 - r2_full), 2),
+    `p: linear vs. categorical` = fmt_p(nested_p(full, models$Categorical)),
+    `p: interaction with course` = fmt_p(nested_p(full, models$Interaction)),
+    check.names = FALSE
+  )
+}
+
+effects <- bind_rows(usage_effect(ais_models, "AIS"), usage_effect(wrs_models, "WRS"))
+int_p_ais <- nested_p(ais_models$Controlled, ais_models$Interaction)
+int_p_wrs <- nested_p(wrs_models$Controlled, wrs_models$Interaction)
+kable(effects, caption = "Table 7. Size of the AI usage effect and model comparison tests")
+```
+
+**Reading Table 7.** The coefficient *b* is the change in score (on the 0–1 scale)
+for each step up in usage frequency, holding the controls constant. The standardized β
+shows the same effect in standard-deviation units. For Cohen's f², 0.02 is
+conventionally small, 0.15 medium, and 0.35 large. A non-significant "linear vs.
+categorical" test means treating usage as a single number is adequate. A
+significant "interaction" test would mean the effect of AI depends on course type.
+
+After controls, each step up in AI use is associated with a
+`r round(effects$"b (per usage step)"[1], 3)` higher AIS and a
+`r round(effects$"b (per usage step)"[2], 3)` higher WRS. The test for different effects by course type gives
+`r p_text(int_p_ais)` for AIS and `r p_text(int_p_wrs)` for WRS, so the effect of AI
+use `r ifelse(int_p_ais < .05, "does", "does not")` differ significantly by course
+type for AIS and `r ifelse(int_p_wrs < .05, "does", "does not")` for WRS.
+
+```{r coef-plot, fig.height=4.5}
+coef_df <- bind_rows(
+  robust_coefs(ais_models$Controlled) %>% mutate(Score = "AIS"),
+  robust_coefs(wrs_models$Controlled) %>% mutate(Score = "WRS")
+) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(term = pretty_term(term),
+         lo = est - 1.96 * se, hi = est + 1.96 * se)
+
+ggplot(coef_df, aes(x = est, y = term, color = Score)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_pointrange(aes(xmin = lo, xmax = hi), position = position_dodge(width = 0.5)) +
+  scale_color_manual(values = pal) +
+  labs(title = "Controlled Model Estimates",
+       subtitle = "Points are estimates; lines are 95% robust confidence intervals",
+       x = "Effect on score (0–1 scale)", y = NULL, color = NULL)
+```
+
+```{r interaction-plot}
+survey %>%
+  pivot_longer(c(AIS, WRS), names_to = "Score", values_to = "Value") %>%
+  ggplot(aes(x = AI_Usage_Freq, y = Value, color = Course_Group)) +
+  geom_jitter(width = 0.12, height = 0, alpha = 0.35) +
+  geom_smooth(method = "lm", se = FALSE, linewidth = 1) +
+  facet_wrap(~ Score) +
+  labs(title = "Does the AI Effect Differ by Course Type?",
+       x = "AI usage frequency (0–4)", y = "Score (0–1)", color = "Course type") +
+  theme(legend.position = "bottom") +
+  guides(color = guide_legend(nrow = 2))
+```
+
+## Attitude items: ordered logistic regression
+
+The four 1–5 attitude items are ordered categories, so they are modeled with
+proportional-odds (ordered logit) models instead of OLS. Each model includes the
+same controls.
+
+```{r ordinal}
+ordinal_outcomes <- c(AI_Learning_Alignment = "AI learning alignment",
+                      AI_Usage_Likelihood   = "AI usage likelihood",
+                      AI_Good_Student       = "AI and being a good student",
+                      AI_Thinking_Change    = "AI changes thinking")
+
+ordinal_results <- bind_rows(lapply(names(ordinal_outcomes), function(y) {
+  d   <- survey %>% mutate(.y = factor(.data[[y]], ordered = TRUE))
+  fit <- polr(as.formula(paste(".y ~ AI_Usage_Freq +", controls)), data = d, Hess = TRUE)
+  co  <- coef(summary(fit))["AI_Usage_Freq", ]
+  p   <- 2 * pnorm(-abs(co[["t value"]]))
+  data.frame(Outcome = ordinal_outcomes[[y]],
+             `Odds ratio` = round(exp(co[["Value"]]), 2),
+             `95% CI` = sprintf("[%.2f, %.2f]",
+                                exp(co[["Value"]] - 1.96 * co[["Std. Error"]]),
+                                exp(co[["Value"]] + 1.96 * co[["Std. Error"]])),
+             p = fmt_p(p),
+             check.names = FALSE)
+}))
+
+kable(ordinal_results,
+      caption = "Table 8. Effect of one step up in AI usage on attitude items (ordered logit)")
+```
+
+An odds ratio above 1 means students who use AI more often are more likely to give
+a higher response on that item. For example, an odds ratio of 2 means each step
+up in usage doubles the odds of choosing a higher category.
+
+## Differences across course types
+
+```{r course-plot, fig.height=5}
+survey %>%
+  pivot_longer(c(AIS, WRS), names_to = "Score", values_to = "Value") %>%
+  ggplot(aes(x = Course_Group, y = Value, fill = Score)) +
+  geom_boxplot(alpha = 0.55, outlier.shape = NA) +
+  geom_jitter(width = 0.15, height = 0, alpha = 0.4, size = 1.3) +
+  facet_wrap(~ Score) +
+  scale_fill_manual(values = pal, guide = "none") +
+  labs(title = "Scores by Course Type", x = NULL, y = "Score (0–1)") +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+```{r course-tests}
+course_test <- function(outcome) {
+  a  <- aov(as.formula(paste(outcome, "~ Course_Group")), data = survey)
+  s  <- summary(a)[[1]]
+  kw <- kruskal.test(as.formula(paste(outcome, "~ Course_Group")), data = survey)
+  data.frame(Outcome = outcome,
+             `ANOVA F` = round(s$`F value`[1], 2),
+             `ANOVA p` = fmt_p(s$`Pr(>F)`[1]),
+             `η²` = round(s$`Sum Sq`[1] / sum(s$`Sum Sq`), 3),
+             `Kruskal-Wallis χ²` = round(kw$statistic[[1]], 2),
+             `Kruskal-Wallis p` = fmt_p(kw$p.value),
+             check.names = FALSE)
+}
+course_results <- bind_rows(course_test("AIS"), course_test("WRS"))
+kable(course_results, caption = "Table 9. Do scores differ by course type?")
+
+tukey <- TukeyHSD(aov(AIS ~ Course_Group, data = survey))$Course_Group
+kable(round(tukey, 3), caption = "Table 10. Tukey pairwise comparisons for AIS")
+```
+
+The Kruskal-Wallis test does not assume normally distributed scores, so it serves
+as a check on the ANOVA. The Kruskal-Wallis test gives
+`r p_text(kruskal.test(AIS ~ Course_Group, data = survey)$p.value)` for AIS and
+`r p_text(kruskal.test(WRS ~ Course_Group, data = survey)$p.value)` for WRS.
+
+# Robustness Checks
+
+## Sensitivity to score construction and sample
+
+The controlled model is re-estimated with (a) equal weights instead of 0.4/0.3/0.3,
+(b) productivity loss reverse-coded, which treats dependence on AI as *lower*
+readiness, and (c) the `r n_minor` respondents under 18 excluded.
+
+```{r sensitivity}
+sens_spec <- list(
+  "AIS, original weights"          = list(y = "AIS",          d = survey),
+  "AIS, equal weights"             = list(y = "AIS_equal",    d = survey),
+  "AIS, excluding under 18"        = list(y = "AIS",          d = filter(survey, !Under_18)),
+  "WRS, original weights"          = list(y = "WRS",          d = survey),
+  "WRS, equal weights"             = list(y = "WRS_equal",    d = survey),
+  "WRS, productivity loss reversed"= list(y = "WRS_reversed", d = survey),
+  "WRS, excluding under 18"        = list(y = "WRS",          d = filter(survey, !Under_18))
+)
+
+sens <- bind_rows(lapply(names(sens_spec), function(nm) {
+  s  <- sens_spec[[nm]]
+  m  <- lm(as.formula(paste(s$y, "~ AI_Usage_Freq +", controls)), data = s$d)
+  rc <- robust_coefs(m)
+  rc <- rc[rc$term == "AI_Usage_Freq", ]
+  data.frame(Specification = nm,
+             `AI usage b` = sprintf("%.3f%s", rc$est, stars(rc$p)),
+             `Robust SE` = round(rc$se, 3),
+             p = fmt_p(rc$p),
+             N = nobs(m),
+             `R²` = round(summary(m)$r.squared, 3),
+             check.names = FALSE)
+}))
+kable(sens, caption = "Table 11. AI usage coefficient across alternative specifications")
+```
+
+*Interpretation: if the coefficient keeps the same sign and significance in every
+row, the findings do not depend on the weighting choices or on including minors.
+Comment especially on the reversed-WRS row: it shows how much the WRS result
+depends on treating "I'd lose productivity without AI" as a sign of readiness.*
+
+## Regression diagnostics
+
+```{r diagnostics, fig.height=7, fig.width=8}
+op <- par(mfrow = c(2, 2), mar = c(4, 4, 3, 1))
+plot(ais_models$Controlled, sub.caption = "AIS controlled model")
+plot(wrs_models$Controlled, sub.caption = "WRS controlled model")
+par(op)
+```
+
+```{r diag-tests}
+diag_row <- function(m, name) {
+  data.frame(Model = name,
+             `Breusch-Pagan p (constant variance)` = fmt_p(bptest(m)$p.value),
+             `Shapiro-Wilk p (normal residuals)` = fmt_p(shapiro.test(residuals(m))$p.value),
+             `Max Cook's distance` = round(max(cooks.distance(m)), 3),
+             check.names = FALSE)
+}
+kable(bind_rows(diag_row(ais_models$Controlled, "AIS"),
+                diag_row(wrs_models$Controlled, "WRS")),
+      caption = "Table 12. Assumption tests (p < .05 suggests a violation)")
+```
+
+
